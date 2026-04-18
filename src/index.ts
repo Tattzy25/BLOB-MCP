@@ -1,19 +1,3 @@
-/**
- * vercel-blob-mcp-server entrypoint.
- *
- * Exposes four Vercel Blob tools over MCP's streamable-HTTP transport.
- *
- * Endpoints:
- *   POST /mcp      — MCP streamable-HTTP transport (stateless, JSON response)
- *   GET  /health   — liveness probe; calls Vercel Blob list({limit:1}) every request
- *   GET  /         — service info
- *
- * Required environment:
- *   BLOB_READ_WRITE_TOKEN   Vercel Blob read/write token.
- *   MCP_SERVER_TOKEN        Bearer token required on every POST /mcp request.
- *   PORT                    TCP port to bind (1-65535).
- */
-
 import express, { type Request, type Response, type NextFunction } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -21,7 +5,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { BlobClient } from "./blob-client.js";
 import { registerBlobTools } from "./tools.js";
 
-const SERVER_NAME = "vercel-blob-mcp-server";
+const SERVER_NAME = "blob-mcp";
 const SERVER_VERSION = "1.0.0";
 
 /** Max JSON body size for POST /mcp. content_base64 uploads travel through this. */
