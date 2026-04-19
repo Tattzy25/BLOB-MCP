@@ -3,16 +3,17 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import express from "express";
 import { z } from "zod";
 import { put, list, del } from "@vercel/blob";
+import { Buffer } from "node:buffer"; // <-- Added this to keep TypeScript happy
 
 // ─────────────────────────────────────────────
 // BLOB OPERATIONS — fetch & upload
 // ─────────────────────────────────────────────
 
-async function downloadBytes(url: string): Promise<Uint8Array> {
+async function downloadBytes(url: string): Promise<Buffer> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to download from URL: ${res.statusText}`);
-  const buffer = await res.arrayBuffer();
-  return new Uint8Array(buffer);
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer); // <-- Wrapped in Buffer here for Vercel
 }
 
 // ─────────────────────────────────────────────
