@@ -2,8 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { z } from "zod";
-import { put, list, del } from "@vercel/blob";
-import { Buffer } from "node:buffer"; // <-- Added this to keep TypeScript happy
+import { put, list, copy } from "@vercel/blob";
+import { Buffer } from "node:buffer";
 
 // ─────────────────────────────────────────────
 // BLOB OPERATIONS — fetch & upload
@@ -13,35 +13,41 @@ async function downloadBytes(url: string): Promise<Buffer> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to download from URL: ${res.statusText}`);
   const arrayBuffer = await res.arrayBuffer();
-  return Buffer.from(arrayBuffer); // <-- Wrapped in Buffer here for Vercel
+  return Buffer.from(arrayBuffer); 
 }
 
 // ─────────────────────────────────────────────
-// MCP SERVER — Bare Metal Blob Tools
+// MCP SERVER — Zero-Fallback Blob Tools
 // ─────────────────────────────────────────────
 
 function createBlobServer(): McpServer {
   const server = new McpServer({
-    name: "vercel-blob-mcp",
+    name: "mcp-server",
     version: "1.0.0",
   });
 
-  // 1. Upload (Put) - Just pass a URL and a destination name
+  // 1. Upload (Put) - Hardcoded public, no validation
   server.tool(
     "vercel_blob_put",
-    "Upload a file to Vercel Blob and get a public URL back.",
+    "Upload a file to Vercel Blob.",
     {
-      source_url: z.string().url().describe("The URL of the image/file you want to upload."),
-      pathname: z.string().min(1).describe("What to name it in Vercel (e.g., 'image.png')."),
-      access: z.enum(["public", "private"]).describe("public or private"),
+      source_url: z.any().describe("Source URL."),
+      pathname: z.any().describe("Vercel pathname."),
     },
     async (params) => {
       try {
-        const fileBytes = await downloadBytes(params.source_url);
-        const result = await put(params.pathname, fileBytes, {
-          access: params.access,
-          // Vercel auto-detects the MIME type from the pathname extension
+        let cleanUrl = Array.isArray(params.source_url) 
+          ? String(params.source_url[0]) 
+          : String(params.source_url);
+        cleanUrl = cleanUrl.replace(/^["']|["']$/g, ''); 
+
+        let cleanPath = String(params.pathname).replace(/^["']|["']$/g, '');
+
+        const fileBytes = await downloadBytes(cleanUrl);
+        const result = await put(cleanPath, fileBytes, {
+          access: "public", 
         });
+        
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (err) {
         return { isError: true, content: [{ type: "text", text: String(err) }] };
@@ -49,16 +55,16 @@ function createBlobServer(): McpServer {
     }
   );
 
-  // 2. List Blobs
+  // 2. List Blobs - RIPPED OUT DEFAULT LIMIT
   server.tool(
     "vercel_blob_list",
-    "List all files currently in Vercel Blob.",
+    "List files in Vercel Blob.",
     {
-      limit: z.number().int().default(100).describe("Max files to return."),
+      limit: z.any().optional().describe("Optional limit."),
     },
     async (params) => {
       try {
-        const result = await list({ limit: params.limit });
+        const result = await list(params);
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (err) {
         return { isError: true, content: [{ type: "text", text: String(err) }] };
@@ -66,17 +72,27 @@ function createBlobServer(): McpServer {
     }
   );
 
-  // 3. Delete Blob
+  // 3. Copy Blob
   server.tool(
-    "vercel_blob_delete",
-    "Delete a file from Vercel Blob using its URL.",
+    "vercel_blob_copy",
+    "Copy an existing blob.",
     {
-      url: z.string().url().describe("The exact Vercel Blob URL to delete."),
+      from_url: z.any().describe("Source URL."),
+      to_pathname: z.any().describe("Destination pathname."),
     },
     async (params) => {
       try {
-        await del(params.url);
-        return { content: [{ type: "text", text: `Successfully deleted: ${params.url}` }] };
+        let cleanUrl = Array.isArray(params.from_url) 
+          ? String(params.from_url[0]) 
+          : String(params.from_url);
+        cleanUrl = cleanUrl.replace(/^["']|["']$/g, ''); 
+
+        let cleanPath = String(params.to_pathname).replace(/^["']|["']$/g, '');
+
+        const result = await copy(cleanUrl, cleanPath, {
+          access: "public",
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       } catch (err) {
         return { isError: true, content: [{ type: "text", text: String(err) }] };
       }
@@ -93,10 +109,8 @@ function createBlobServer(): McpServer {
 const app = express();
 app.use(express.json());
 
-app.get("/favicon.ico", (_req, res) => res.status(204).end());
-
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", service: "vercel-blob-mcp-server" });
+  res.json({ status: "ok" });
 });
 
 app.post("/mcp", async (req, res) => {
@@ -111,14 +125,10 @@ app.post("/mcp", async (req, res) => {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (error) {
-    console.error(`MCP Error:`, error);
     if (!res.headersSent) {
       res.status(500).json({ error: "Internal server error" });
     }
   }
 });
 
-const port = parseInt(process.env.PORT || "3002");
-app.listen(port, () => {
-  console.log(`Vercel Blob MCP running on :${port}`);
-});
+app.listen(process.env.PORT);
