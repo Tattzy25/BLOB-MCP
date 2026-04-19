@@ -1,174 +1,123 @@
-import express, { type Request, type Response, type NextFunction } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import express from "express";
+import { z } from "zod";
+import { put, list, del } from "@vercel/blob";
 
-import { BlobClient } from "./blob-client.js";
-import { registerBlobTools } from "./tools.js";
+// ─────────────────────────────────────────────
+// BLOB OPERATIONS — fetch & upload
+// ─────────────────────────────────────────────
 
-const SERVER_NAME = "blob-mcp";
-const SERVER_VERSION = "1.0.0";
-
-/** Max JSON body size for POST /mcp. content_base64 uploads travel through this. */
-const BODY_LIMIT = "50mb";
-
-function logJson(
-  level: "info" | "warn" | "error",
-  msg: string,
-  extra?: Record<string, unknown>
-): void {
-  process.stderr.write(
-    JSON.stringify({
-      level,
-      msg,
-      service: SERVER_NAME,
-      ts: new Date().toISOString(),
-      ...extra,
-    }) + "\n"
-  );
+async function downloadBytes(url: string): Promise<Uint8Array> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to download from URL: ${res.statusText}`);
+  const buffer = await res.arrayBuffer();
+  return new Uint8Array(buffer);
 }
 
-function requireEnv(name: string): string {
-  const v = process.env[name];
-  if (v === undefined || v === "") {
-    logJson("error", `Required environment variable ${name} is not set. Exiting.`);
-    process.exit(1);
-  }
-  return v;
-}
+// ─────────────────────────────────────────────
+// MCP SERVER — Bare Metal Blob Tools
+// ─────────────────────────────────────────────
 
-function requirePortEnv(): number {
-  const raw = requireEnv("PORT");
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n < 1 || n > 65535) {
-    logJson("error", `PORT must be an integer between 1 and 65535. Got: ${raw}. Exiting.`);
-    process.exit(1);
-  }
-  return n;
-}
+function createBlobServer(): McpServer {
+  const server = new McpServer({
+    name: "vercel-blob-mcp",
+    version: "1.0.0",
+  });
 
-async function main(): Promise<void> {
-  const blobToken = requireEnv("BLOB_READ_WRITE_TOKEN");
-  const mcpServerToken = requireEnv("MCP_SERVER_TOKEN");
-  const port = requirePortEnv();
-
-  const client = new BlobClient(blobToken);
-
-  function buildServer(): McpServer {
-    const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
-    registerBlobTools(server, client);
-    return server;
-  }
-
-  const app = express();
-  app.use(express.json({ limit: BODY_LIMIT }));
-
-  // Bearer middleware — always enforced. No "if unset, skip" branch.
-  function requireBearer(req: Request, res: Response, next: NextFunction): void {
-    const auth = req.header("authorization") ?? "";
-    const expected = `Bearer ${mcpServerToken}`;
-    if (auth !== expected) {
-      res
-        .status(401)
-        .set("WWW-Authenticate", 'Bearer realm="mcp"')
-        .json({
-          jsonrpc: "2.0",
-          error: { code: -32001, message: "Unauthorized: missing or invalid Bearer token" },
-          id: null,
+  // 1. Upload (Put) - Just pass a URL and a destination name
+  server.tool(
+    "vercel_blob_put",
+    "Upload a file to Vercel Blob and get a public URL back.",
+    {
+      source_url: z.string().url().describe("The URL of the image/file you want to upload."),
+      pathname: z.string().min(1).describe("What to name it in Vercel (e.g., 'image.png')."),
+      access: z.enum(["public", "private"]).describe("public or private"),
+    },
+    async (params) => {
+      try {
+        const fileBytes = await downloadBytes(params.source_url);
+        const result = await put(params.pathname, fileBytes, {
+          access: params.access,
+          // Vercel auto-detects the MIME type from the pathname extension
         });
-      return;
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        return { isError: true, content: [{ type: "text", text: String(err) }] };
+      }
     }
-    next();
-  }
+  );
 
-  // Health: actually pings upstream. 200 only when upstream responded; 503 otherwise.
-  app.get("/health", async (_req: Request, res: Response) => {
-    const result = await client.healthCheck();
-    if (result.ok) {
-      res.status(200).json({
-        status: "ok",
-        service: SERVER_NAME,
-        version: SERVER_VERSION,
-        upstream: "vercel-blob",
-      });
-    } else {
-      res.status(503).json({
-        status: "unhealthy",
-        service: SERVER_NAME,
-        version: SERVER_VERSION,
-        upstream: "vercel-blob",
-        upstream_status: result.status,
-        error: result.message,
-      });
+  // 2. List Blobs
+  server.tool(
+    "vercel_blob_list",
+    "List all files currently in Vercel Blob.",
+    {
+      limit: z.number().int().default(100).describe("Max files to return."),
+    },
+    async (params) => {
+      try {
+        const result = await list({ limit: params.limit });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        return { isError: true, content: [{ type: "text", text: String(err) }] };
+      }
     }
-  });
+  );
 
-  // Service info.
-  app.get("/", (_req: Request, res: Response) => {
-    res.status(200).json({
-      service: SERVER_NAME,
-      version: SERVER_VERSION,
-      transport: "streamable-http",
-      mcp_endpoint: "/mcp",
-      health_endpoint: "/health",
-      tools: [
-        "vercel_blob_put",
-        "vercel_blob_get",
-        "vercel_blob_list",
-        "vercel_blob_copy",
-      ],
-    });
-  });
+  // 3. Delete Blob
+  server.tool(
+    "vercel_blob_delete",
+    "Delete a file from Vercel Blob using its URL.",
+    {
+      url: z.string().url().describe("The exact Vercel Blob URL to delete."),
+    },
+    async (params) => {
+      try {
+        await del(params.url);
+        return { content: [{ type: "text", text: `Successfully deleted: ${params.url}` }] };
+      } catch (err) {
+        return { isError: true, content: [{ type: "text", text: String(err) }] };
+      }
+    }
+  );
 
-  // MCP endpoint.
-  app.post("/mcp", requireBearer, async (req: Request, res: Response) => {
-    const server = buildServer();
+  return server;
+}
+
+// ─────────────────────────────────────────────
+// EXPRESS — Streamable HTTP Transport
+// ─────────────────────────────────────────────
+
+const app = express();
+app.use(express.json());
+
+app.get("/favicon.ico", (_req, res) => res.status(204).end());
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", service: "vercel-blob-mcp-server" });
+});
+
+app.post("/mcp", async (req, res) => {
+  try {
+    const server = createBlobServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
     });
-
-    res.on("close", () => {
-      transport.close().catch(() => undefined);
-      server.close().catch(() => undefined);
-    });
-
-    try {
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-    } catch (err) {
-      logJson("error", "MCP request handling failed", {
-        err: err instanceof Error ? err.message : String(err),
-      });
-      if (!res.headersSent) {
-        res.status(500).json({
-          jsonrpc: "2.0",
-          error: { code: -32603, message: "Internal server error" },
-          id: null,
-        });
-      }
+    
+    res.on("close", () => transport.close());
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error(`MCP Error:`, error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Internal server error" });
     }
-  });
+  }
+});
 
-  // Non-POST methods on /mcp.
-  app.all("/mcp", (_req: Request, res: Response) => {
-    res.status(405).set("Allow", "POST").json({
-      jsonrpc: "2.0",
-      error: { code: -32000, message: "Method Not Allowed — use POST /mcp" },
-      id: null,
-    });
-  });
-
-  app.listen(port, () => {
-    logJson("info", `${SERVER_NAME} listening`, {
-      port,
-      mcp_endpoint: `http://0.0.0.0:${port}/mcp`,
-    });
-  });
-}
-
-main().catch((err) => {
-  logJson("error", "Fatal error starting server", {
-    err: err instanceof Error ? err.message : String(err),
-  });
-  process.exit(1);
+const port = parseInt(process.env.PORT || "3002");
+app.listen(port, () => {
+  console.log(`Vercel Blob MCP running on :${port}`);
 });
